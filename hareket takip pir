@@ -1,0 +1,737 @@
+"""
+ESP32 MicroPython - Hareket Sensörü Gerçek Zamanlı İzleme
+==========================================================
+Donanım:
+  - PIR Hareket Sensörü (HC-SR501 veya muadili)
+    VCC  → 3.3V (veya 5V, sensöre göre)
+    GND  → GND
+    OUT  → GPIO 2
+
+Kurulum:
+  1. Bu dosyayı Thonny veya ampy ile ESP32'ye "main.py" olarak yükleyin.
+  2. index.html dosyasını da ESP32'ye yükleyin (ampy put index.html).
+  3. WIFI_SSID ve WIFI_PASSWORD değerlerini kendi ağınıza göre düzenleyin.
+  4. ESP32'yi yeniden başlatın; Serial Monitor'dan IP adresini öğrenin.
+  5. Tarayıcıdan http://<ESP32_IP>/ adresini açın.
+"""
+
+import network
+import socket
+import time
+import json
+import gc
+from machine import Pin
+
+# ─────────────────────────────────────────────
+# AYARLAR — Kendi değerlerinizle değiştirin
+# ─────────────────────────────────────────────
+WIFI_SSID     = "ağ ismi"
+WIFI_PASSWORD = "ağ şifresi"
+
+SENSOR_PIN    = 2       # PIR sensör çıkış pini
+DEBOUNCE_MS   = 500      # Aynı olayın tekrar sayılması için bekleme (ms)
+MAX_EVENTS    = 50       # Bellekte tutulacak en fazla olay sayısı
+CHUNK_SIZE    = 512      # HTML gönderiminde parça büyüklüğü (bytes)
+# ─────────────────────────────────────────────
+
+# Durum değişkenleri
+motion_state  = False
+event_count   = 0
+last_trigger  = 0
+events_log    = []
+uptime_start  = time.ticks_ms()
+
+# ── GPIO Kurulumu ──────────────────────────────
+sensor = Pin(SENSOR_PIN, Pin.IN)
+
+def sensor_isr(pin):
+    global motion_state, event_count, last_trigger, events_log
+    now = time.ticks_ms()
+    if time.ticks_diff(now, last_trigger) < DEBOUNCE_MS:
+        return
+    last_trigger = now
+    motion_state = bool(pin.value())
+    if motion_state:
+        event_count += 1
+    events_log.append({"t": now, "s": 1 if motion_state else 0})
+    if len(events_log) > MAX_EVENTS:
+        events_log.pop(0)
+
+sensor.irq(trigger=Pin.IRQ_RISING | Pin.IRQ_FALLING, handler=sensor_isr)
+
+# ── Wi-Fi Bağlantısı ──────────────────────────
+def connect_wifi():
+    sta = network.WLAN(network.STA_IF)
+    sta.active(True)
+    if not sta.isconnected():
+        print("Wi-Fi bağlanıyor: {}".format(WIFI_SSID))
+        sta.connect(WIFI_SSID, WIFI_PASSWORD)
+        for _ in range(20):
+            if sta.isconnected():
+                break
+            time.sleep(0.5)
+            print(".", end="")
+        print()
+    if sta.isconnected():
+        ip = sta.ifconfig()[0]
+        print("Bağlandı! IP: {}".format(ip))
+        return ip
+    else:
+        raise RuntimeError("Wi-Fi bağlantısı kurulamadı!")
+
+# ── Yardımcı Fonksiyonlar ─────────────────────
+def uptime_seconds():
+    return time.ticks_diff(time.ticks_ms(), uptime_start) // 1000
+
+def build_json():
+    return json.dumps({
+        "motion": motion_state,
+        "count":  event_count,
+        "uptime": uptime_seconds(),
+        "pin":    SENSOR_PIN,
+        "log":    events_log[-10:]
+    })
+
+
+def send_all(conn, data):
+    """Büyük veriyi parçalar halinde güvenli şekilde gönder."""
+    if isinstance(data, str):
+        data = data.encode()
+    view = memoryview(data)
+    total = len(data)
+    sent  = 0
+    while sent < total:
+        chunk = view[sent:sent + CHUNK_SIZE]
+        try:
+            n = conn.write(chunk)
+            if n is None:
+                break
+            sent += n
+        except OSError:
+            break
+
+def send_response(conn, status, content_type, body):
+    if isinstance(body, str):
+        body = body.encode()
+    header = (
+        "HTTP/1.1 {}\r\n"
+        "Content-Type: {}\r\n"
+        "Content-Length: {}\r\n"
+        "Connection: close\r\n"
+        "Access-Control-Allow-Origin: *\r\n"
+        "\r\n"
+    ).format(status, content_type, len(body))
+    send_all(conn, header)
+    send_all(conn, body)
+
+# ── HTTP İstek İşleyici ───────────────────────
+def handle_request(conn):
+    global event_count, events_log
+    try:
+        # İsteği oku — tarayıcı bazen birden fazla pakette gönderir
+        raw = b""
+        conn.settimeout(5)
+        while True:
+            try:
+                chunk = conn.recv(256)
+                if not chunk:
+                    break
+                raw += chunk
+                # HTTP header sonu: çift CRLF
+                if b"\r\n\r\n" in raw:
+                    break
+            except OSError:
+                break
+
+        if not raw:
+            return
+
+        first_line = raw.decode("utf-8", "ignore").split("\r\n")[0]
+        parts = first_line.split(" ")
+        if len(parts) < 2:
+            return
+        path = parts[1].split("?")[0]   # query string varsa at
+
+        if path == "/" or path == "/index.html":
+            html = '''
+            
+                        <!DOCTYPE html>
+            <html lang="tr">
+
+            <head>
+                <meta charset="UTF-8" />
+                <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+                <title>ESP32 — Hareket Sensörü İzleme</title>
+                <style>
+                    /* ── Google Font ── */
+                    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;900&display=swap');
+
+                    :root {
+                        --bg: #0d0f1a;
+                        --panel: #141728;
+                        --border: #1e2540;
+                        --accent: #7c6ef5;
+                        --accent2: #4fd1c5;
+                        --danger: #f56565;
+                        --success: #48bb78;
+                        --muted: #6b7a99;
+                        --text: #e2e8f0;
+                        --radius: 16px;
+                    }
+
+                    *,
+                    *::before,
+                    *::after {
+                        box-sizing: border-box;
+                        margin: 0;
+                        padding: 0;
+                    }
+
+                    body {
+                        font-family: 'Inter', sans-serif;
+                        background: var(--bg);
+                        color: var(--text);
+                        min-height: 100vh;
+                        padding: 24px 16px;
+                    }
+
+                    /* ── Header ── */
+                    header {
+                        text-align: center;
+                        margin-bottom: 32px;
+                    }
+
+                    header h1 {
+                        font-size: clamp(1.6rem, 4vw, 2.4rem);
+                        font-weight: 900;
+                        background: linear-gradient(135deg, var(--accent), var(--accent2));
+                        -webkit-background-clip: text;
+                        -webkit-text-fill-color: transparent;
+                        background-clip: text;
+                        letter-spacing: -0.5px;
+                    }
+
+                    header p {
+                        color: var(--muted);
+                        font-size: .85rem;
+                        margin-top: 6px;
+                    }
+
+                    /* ── Grid ── */
+                    .grid {
+                        display: grid;
+                        grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+                        gap: 20px;
+                        max-width: 1100px;
+                        margin: 0 auto;
+                    }
+
+                    /* ── Card ── */
+                    .card {
+                        background: var(--panel);
+                        border: 1px solid var(--border);
+                        border-radius: var(--radius);
+                        padding: 24px;
+                        position: relative;
+                        overflow: hidden;
+                        transition: transform .2s, box-shadow .2s;
+                    }
+
+                    .card:hover {
+                        transform: translateY(-3px);
+                        box-shadow: 0 12px 40px rgba(0, 0, 0, .4);
+                    }
+
+                    .card::before {
+                        content: '';
+                        position: absolute;
+                        inset: 0;
+                        background: linear-gradient(135deg, rgba(124, 110, 245, .06), transparent);
+                        pointer-events: none;
+                    }
+
+                    .card-title {
+                        font-size: .72rem;
+                        font-weight: 700;
+                        letter-spacing: 1.5px;
+                        text-transform: uppercase;
+                        color: var(--muted);
+                        margin-bottom: 16px;
+                    }
+
+                    /* ── Motion Indicator ── */
+                    .motion-ring {
+                        width: 120px;
+                        height: 120px;
+                        border-radius: 50%;
+                        margin: 0 auto 16px;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        font-size: 2.8rem;
+                        border: 3px solid var(--border);
+                        transition: all .4s ease;
+                        position: relative;
+                    }
+
+                    .motion-ring.active {
+                        border-color: var(--danger);
+                        box-shadow: 0 0 0 8px rgba(245, 101, 101, .15), 0 0 40px rgba(245, 101, 101, .3);
+                    }
+
+                    .motion-ring.active::after {
+                        content: '';
+                        position: absolute;
+                        inset: -10px;
+                        border-radius: 50%;
+                        border: 2px solid var(--danger);
+                        opacity: .4;
+                        animation: pulse-ring 1.2s ease-out infinite;
+                    }
+
+                    @keyframes pulse-ring {
+                        0% {
+                            transform: scale(1);
+                            opacity: .4;
+                        }
+
+                        100% {
+                            transform: scale(1.4);
+                            opacity: 0;
+                        }
+                    }
+
+                    .motion-ring.idle {
+                        border-color: var(--success);
+                        box-shadow: 0 0 30px rgba(72, 187, 120, .15);
+                    }
+
+                    .status-label {
+                        text-align: center;
+                        font-size: 1.05rem;
+                        font-weight: 700;
+                        letter-spacing: .5px;
+                    }
+
+                    .status-label.active {
+                        color: var(--danger);
+                    }
+
+                    .status-label.idle {
+                        color: var(--success);
+                    }
+
+                    /* ── Big Number ── */
+                    .big-num {
+                        font-size: 3.5rem;
+                        font-weight: 900;
+                        background: linear-gradient(135deg, var(--accent), var(--accent2));
+                        -webkit-background-clip: text;
+                        -webkit-text-fill-color: transparent;
+                        background-clip: text;
+                        line-height: 1;
+                    }
+
+                    .big-num-sub {
+                        color: var(--muted);
+                        font-size: .8rem;
+                        margin-top: 6px;
+                    }
+
+                    /* ── Chart ── */
+                    #chart-card {
+                        grid-column: 1 / -1;
+                    }
+
+                    canvas {
+                        width: 100% !important;
+                    }
+
+                    /* ── Log Table ── */
+                    #log-card {
+                        grid-column: 1 / -1;
+                    }
+
+                    .log-table {
+                        width: 100%;
+                        border-collapse: collapse;
+                        font-size: .83rem;
+                    }
+
+                    .log-table th,
+                    .log-table td {
+                        padding: 10px 14px;
+                        text-align: left;
+                        border-bottom: 1px solid var(--border);
+                    }
+
+                    .log-table thead th {
+                        color: var(--muted);
+                        font-weight: 600;
+                        font-size: .72rem;
+                        letter-spacing: 1px;
+                        text-transform: uppercase;
+                    }
+
+                    .log-table tbody tr:last-child td {
+                        border-bottom: none;
+                    }
+
+                    .badge {
+                        display: inline-block;
+                        padding: 3px 10px;
+                        border-radius: 99px;
+                        font-size: .72rem;
+                        font-weight: 700;
+                    }
+
+                    .badge.on {
+                        background: rgba(245, 101, 101, .15);
+                        color: var(--danger);
+                    }
+
+                    .badge.off {
+                        background: rgba(72, 187, 120, .15);
+                        color: var(--success);
+                    }
+
+                    /* ── Reset Button ── */
+                    #reset-btn {
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 8px;
+                        padding: 10px 20px;
+                        border: 1px solid var(--border);
+                        border-radius: 10px;
+                        background: transparent;
+                        color: var(--muted);
+                        font-size: .82rem;
+                        font-family: inherit;
+                        cursor: pointer;
+                        transition: all .2s;
+                        margin-top: 16px;
+                    }
+
+                    #reset-btn:hover {
+                        border-color: var(--accent);
+                        color: var(--accent);
+                        background: rgba(124, 110, 245, .08);
+                    }
+
+                    /* ── Status Bar ── */
+                    .statusbar {
+                        text-align: center;
+                        font-size: .75rem;
+                        color: var(--muted);
+                        margin-top: 28px;
+                    }
+
+                    .dot {
+                        display: inline-block;
+                        width: 7px;
+                        height: 7px;
+                        border-radius: 50%;
+                        background: var(--success);
+                        margin-right: 6px;
+                        animation: blink 1.5s ease-in-out infinite;
+                    }
+
+                    .dot.err {
+                        background: var(--danger);
+                        animation: none;
+                    }
+
+                    @keyframes blink {
+
+                        0%,
+                        100% {
+                            opacity: 1
+                        }
+
+                        50% {
+                            opacity: .3
+                        }
+                    }
+
+                    /* ── Pin badge ── */
+                    .pin-badge {
+                        display: inline-flex;
+                        align-items: center;
+                        gap: 6px;
+                        background: rgba(79, 209, 197, .1);
+                        border: 1px solid rgba(79, 209, 197, .3);
+                        border-radius: 8px;
+                        padding: 4px 12px;
+                        font-size: .78rem;
+                        color: var(--accent2);
+                        font-weight: 600;
+                    }
+                </style>
+            </head>
+
+            <body>
+
+                <header>
+                    <h1>🛡️ ESP32 Hareket Sensörü</h1>
+                    <p>Gerçek Zamanlı PIR Sensör İzleme Paneli &nbsp;|&nbsp; MicroPython</p>
+                </header>
+
+                <div class="grid">
+
+                    <!-- Durum Kartı -->
+                    <div class="card" id="status-card">
+                        <div class="card-title">Anlık Durum</div>
+                        <div class="motion-ring idle" id="motion-ring">🔍</div>
+                        <div class="status-label idle" id="status-text">Bekleniyor…</div>
+                        <div style="text-align:center;margin-top:14px">
+                            <span class="pin-badge">📌 GPIO <span id="pin-num">—</span></span>
+                        </div>
+                    </div>
+
+                    <!-- Sayaç Kartı -->
+                    <div class="card">
+                        <div class="card-title">Toplam Hareket</div>
+                        <div class="big-num" id="count-num">0</div>
+                        <div class="big-num-sub">tetiklenme sayısı</div>
+                        <button id="reset-btn">⟳ Sayacı Sıfırla</button>
+                    </div>
+
+                    <!-- Çalışma Süresi -->
+                    <div class="card">
+                        <div class="card-title">Çalışma Süresi</div>
+                        <div class="big-num" id="uptime-num">0s</div>
+                        <div class="big-num-sub">ESP32 açıldığından beri</div>
+                    </div>
+
+                    <!-- Grafik -->
+                    <div class="card" id="chart-card">
+                        <div class="card-title">Son 60 Saniye — Hareket Zaman Çizelgesi</div>
+                        <canvas id="motionChart" height="110"></canvas>
+                    </div>
+
+                    <!-- Olay Günlüğü -->
+                    <div class="card" id="log-card">
+                        <div class="card-title">Son Olaylar</div>
+                        <table class="log-table">
+                            <thead>
+                                <tr>
+                                    <th>#</th>
+                                    <th>Zaman (ms)</th>
+                                    <th>Durum</th>
+                                </tr>
+                            </thead>
+                            <tbody id="log-body">
+                                <tr>
+                                    <td colspan="3" style="color:var(--muted);text-align:center">Veri bekleniyor…</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                </div>
+
+                <div class="statusbar">
+                    <span class="dot" id="conn-dot"></span>
+                    <span id="conn-status">Bağlanıyor…</span>
+                    &nbsp;|&nbsp; Son güncelleme: <span id="last-update">—</span>
+                </div>
+
+                <!-- Chart.js (CDN — cihaz internete bağlıysa çalışır, değilse güzel bozulmaz) -->
+                <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+                <script>
+                    // ── ESP32 IP Ayarı ────────────────────────────────────────────
+                    // Sayfa ESP32'den açıldığında otomatik algılanır.
+                    // Bilgisayardan doğrudan açıyorsanız aşağıya ESP32'nin IP'sini yazın:
+                    //   const ESP32_IP = 'http://192.168.1.42';
+                    const ESP32_IP = '';
+                    const BASE_URL = ESP32_IP || (location.protocol === 'file:' ? '' : window.location.origin);
+
+                    // ── Grafik ──────────────────────────────────────────────────
+                    const MAX_PTS = 60;
+                    const labels = Array.from({ length: MAX_PTS }, () => '');
+                    const dataset = Array(MAX_PTS).fill(0);
+                    let chart = null;
+
+                    try {
+                        const ctx = document.getElementById('motionChart').getContext('2d');
+                        chart = new Chart(ctx, {
+                            type: 'line',
+                            data: {
+                                labels,
+                                datasets: [{
+                                    label: 'Hareket',
+                                    data: dataset,
+                                    fill: true,
+                                    tension: 0.4,
+                                    borderColor: '#7c6ef5',
+                                    backgroundColor: 'rgba(124,110,245,.15)',
+                                    pointRadius: 0,
+                                    borderWidth: 2,
+                                    stepped: true
+                                }]
+                            },
+                            options: {
+                                animation: false,
+                                responsive: true,
+                                scales: {
+                                    y: {
+                                        min: -0.1, max: 1.1,
+                                        ticks: {
+                                            callback: v => v === 1 ? 'VAR' : v === 0 ? 'YOK' : '',
+                                            color: '#6b7a99'
+                                        },
+                                        grid: { color: 'rgba(255,255,255,.05)' }
+                                    },
+                                    x: {
+                                        ticks: { display: false },
+                                        grid: { color: 'rgba(255,255,255,.05)' }
+                                    }
+                                },
+                                plugins: { legend: { display: false } }
+                            }
+                        });
+                    } catch (e) {
+                        // Chart.js CDN yüklenemedi — grafik kartını gizle, diğer işlevler çalışmaya devam eder
+                        const cc = document.getElementById('chart-card');
+                        if (cc) cc.style.display = 'none';
+                    }
+
+                    function pushChart(value) {
+                        if (!chart) return;   // Chart.js yoksa sessizce atla
+                        dataset.push(value ? 1 : 0);
+                        labels.push('');
+                        if (dataset.length > MAX_PTS) { dataset.shift(); labels.shift(); }
+                        chart.update();
+                    }
+
+                    // ── Durum güncelleyici ───────────────────────────────────────
+                    function setMotion(active) {
+                        const ring = document.getElementById('motion-ring');
+                        const txt = document.getElementById('status-text');
+                        if (active) {
+                            ring.className = 'motion-ring active';
+                            ring.textContent = '🚨';
+                            txt.className = 'status-label active';
+                            txt.textContent = 'HAREKET ALGILANDI!';
+                        } else {
+                            ring.className = 'motion-ring idle';
+                            ring.textContent = '🔍';
+                            txt.className = 'status-label idle';
+                            txt.textContent = 'Bölge Sakin';
+                        }
+                    }
+
+                    function formatUptime(s) {
+                        if (s < 60) return s + 's';
+                        if (s < 3600) return Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+                        return Math.floor(s / 3600) + 'h ' + Math.floor((s % 3600) / 60) + 'm';
+                    }
+
+                    function updateLog(log) {
+                        const tbody = document.getElementById('log-body');
+                        if (!log || !log.length) return;
+                        tbody.innerHTML = log.slice().reverse().map((e, i) => `
+                                                    <tr>
+                                                    <td style="color:var(--muted)">${log.length - i}</td>
+                                                    <td>${e.t} ms</td>
+                                                    <td><span class="badge ${e.s ? 'on' : 'off'}">${e.s ? 'HAREKET' : 'SESSIZ'}</span></td>
+                                                    </tr>`).join('');
+                    }
+
+                    // ── Polling /data ─────────────────────────────────────────────
+                    let errorCount = 0;
+
+                    async function fetchData() {
+                        try {
+                            const res = await fetch('http://192.168.1.104/data');
+                            const data = await res.json();
+                            errorCount = 0;
+
+                            setMotion(data.motion);
+                            document.getElementById('count-num').textContent = data.count;
+                            document.getElementById('uptime-num').textContent = formatUptime(data.uptime);
+                            document.getElementById('pin-num').textContent = data.pin;
+                            document.getElementById('last-update').textContent = new Date().toLocaleTimeString('tr-TR');
+                            document.getElementById('conn-dot').className = 'dot';
+                            document.getElementById('conn-status').textContent = 'Bağlı';
+                            pushChart(data.motion);
+                            updateLog(data.log);
+                        } catch (e) {
+                            errorCount++;
+                            if (errorCount > 3) {
+                                document.getElementById('conn-dot').className = 'dot err';
+                                document.getElementById('conn-status').textContent = 'Bağlantı Hatası — yeniden deneniyor…';
+                            }
+                        }
+                    }
+
+                    async function resetCounter() {
+                        try {
+                            await fetch(BASE_URL + '/reset');
+                            document.getElementById('count-num').textContent = '0';
+                            document.getElementById('log-body').innerHTML =
+                                '<tr><td colspan="3" style="color:var(--muted);text-align:center">Sıfırlandı.</td></tr>';
+                        } catch (e) { alert('Sıfırlama başarısız: ' + e); }
+                    }
+
+                    // Sıfırla butonunu addEventListener ile bağla (inline onclick yerine)
+                    document.getElementById('reset-btn').addEventListener('click', resetCounter);
+
+                    // İlk çekimi hemen yap, sonra her 1 saniyede tekrarla
+                    fetchData();
+                    setInterval(fetchData, 1000);
+                </script>
+            </body>
+
+            </html>
+
+            '''
+            send_response(conn, "200 OK", "text/html; charset=utf-8", html)
+
+        elif path == "/data":
+            body = build_json()
+            send_response(conn, "200 OK", "application/json", body)
+
+        elif path == "/reset":
+            event_count = 0
+            events_log  = []
+            send_response(conn, "200 OK", "application/json", '{"ok":true}')
+
+        else:
+            send_response(conn, "404 Not Found", "text/plain", "Not Found")
+
+    except OSError as e:
+        # ETIMEDOUT (116) ve benzeri ağ hataları — normal durum, sessizce geç
+        pass
+    finally:
+        try:
+            conn.close()
+        except:
+            pass
+        gc.collect()
+
+# ── Ana Döngü ─────────────────────────────────
+def main():
+    ip = connect_wifi()
+    print("\n>>> Web arayuzu: http://{}/".format(ip))
+    print(">>> JSON API   : http://{}/data".format(ip))
+    print(">>> Sayac sifir: http://{}/reset\n".format(ip))
+
+    addr = socket.getaddrinfo("0.0.0.0", 80)[0][-1]
+    srv  = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(addr)
+    srv.listen(3)      # backlog: 3 bağlantıya kadar kuyruğa al
+    srv.settimeout(1)  # accept() için kısa zaman aşımı
+    print("HTTP sunucusu port 80'de dinleniyor...")
+
+    while True:
+        try:
+            conn, addr = srv.accept()
+            handle_request(conn)
+        except OSError:
+            pass        # accept() zaman aşımı — normal, döngüye devam et
+        gc.collect()
+
+main()
+
