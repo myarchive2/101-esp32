@@ -1,0 +1,83 @@
+from machine import ADC, Pin
+import time
+
+# LDR'nin bağlı olduğu pin (ör: GPIO34)
+ldr = ADC(Pin(34))
+
+# ADC ayarları
+ldr.atten(ADC.ATTN_11DB)      # 0 - 3.3V arası ölçüm
+ldr.width(ADC.WIDTH_12BIT)   # 0 - 4095 arası değer
+
+while True:
+    deger = ldr.read()
+    print("LDR değeri:", deger)
+    time.sleep(0.1)
+
+"""
+# Analog pinler (X ve Y)
+x_adc = ADC(Pin(32))
+y_adc = ADC(Pin(33))
+
+kirmizi = Pin(2, Pin.OUT)
+sari = Pin(4, Pin.OUT)
+yesil = Pin(23, Pin.OUT)
+mavi = Pin(22, Pin.OUT)
+
+# ADC ayarları (ESP32 için)
+x_adc.atten(ADC.ATTN_11DB)  # 0-3.3V arası okuma
+y_adc.atten(ADC.ATTN_11DB)
+
+x_adc.width(ADC.WIDTH_12BIT)  # 0-4095 arası değer
+y_adc.width(ADC.WIDTH_12BIT)
+
+# Buton (SW)
+sw = Pin(34, Pin.IN)
+
+while True:
+    x_val = x_adc.read()
+    y_val = y_adc.read()
+    #kirmizi.value(1)
+    #yesil.value(1)
+    #sari.value(1)
+    #mavi.value(1)
+    if x_val > 4094 and y_val> 3500:
+        kirmizi.value(1)
+        sari.value(0)
+        mavi.value(0)
+        yesil.value(0)
+        
+    elif x_val < 1500 and y_val >1000:
+        kirmizi.value(0)
+        sari.value(1)
+        mavi.value(0)
+        yesil.value(0)
+        
+
+        
+    elif y_val < 1500 and x_val >1000:
+        kirmizi.value(0)
+        sari.value(0)
+        mavi.value(1)
+        yesil.value(0)
+                
+    elif x_val < 150 and y_val < 150:
+        kirmizi.value(0)
+        sari.value(0)
+        mavi.value(0)
+        yesil.value(1)
+    else:
+        kirmizi.value(0)
+        sari.value(0)
+        mavi.value(0)
+        yesil.value(0)
+
+    print("X:", x_val, "Y:", y_val,)
+
+    time.sleep(0.2)
+"""
+
+
+
+
+
+
